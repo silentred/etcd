@@ -204,6 +204,9 @@ type ServerConfig struct {
 
 	// Metrics types of metrics - should be either 'basic' or 'extensive'
 	Metrics string
+
+	// ExperimentalMaxIndexGap is the maximum gap between committed index and applyied index in Raft progress
+	ExperimentalMaxIndexGap uint64 `json:"experimental-max-index-gap"`
 }
 
 // VerifyBootstrap sanity-checks the initial config for bootstrap case

@@ -235,6 +235,7 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
 		LocalAddress:                      cfg.InferLocalAddr(),
 		ServerFeatureGate:                 cfg.ServerFeatureGate,
 		Metrics:                           cfg.Metrics,
+		ExperimentalMaxIndexGap:           cfg.ExperimentalMaxIndexGap,
 	}
 
 	if srvcfg.EnableDistributedTracing {
@@ -380,6 +381,7 @@ func print(lg *zap.Logger, ec Config, sc config.ServerConfig, memberInitialized 
 
 		zap.String("downgrade-check-interval", sc.DowngradeCheckTime.String()),
 		zap.Int("max-learners", sc.MaxLearners),
+		zap.Uint64("experimental-max-index-gap", sc.ExperimentalMaxIndexGap),
 
 		zap.String("v2-deprecation", string(ec.V2Deprecation)),
 	)

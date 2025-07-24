@@ -76,6 +76,12 @@ const (
 	DefaultCompactHashCheckTime        = time.Minute
 	DefaultLoggingFormat               = "json"
 
+	// In the health case, there might be a small gap (10s of entries) between
+	// the applied index and committed index.
+	// However, if the committed entries are very heavy to toApply, the gap might grow.
+	// We should stop accepting new proposals if the gap growing to a certain point.
+	DefaultMaxGapBetweenApplyAndCommitIndex uint64 = 5000
+
 	DefaultDiscoveryDialTimeout       = 2 * time.Second
 	DefaultDiscoveryRequestTimeOut    = 5 * time.Second
 	DefaultDiscoveryKeepAliveTime     = 2 * time.Second
@@ -453,6 +459,9 @@ type Config struct {
 	// Deprecated: The default value is enforced, to be removed in v3.8.
 	V2Deprecation config.V2DeprecationEnum `json:"v2-deprecation"`
 
+	// ExperimentalMaxIndexGap is the maximum gap between committed index and applyied index in Raft progress
+	ExperimentalMaxIndexGap uint64 `json:"experimental-max-index-gap"`
+
 	// ServerFeatureGate is a server level feature gate
 	ServerFeatureGate featuregate.FeatureGate
 	// FlagsExplicitlySet stores if a flag is explicitly set from the cmd line or config file.
@@ -514,6 +523,8 @@ func NewConfig() *Config {
 		MaxRequestBytes:      DefaultMaxRequestBytes,
 		MaxConcurrentStreams: DefaultMaxConcurrentStreams,
 		WarningApplyDuration: DefaultWarningApplyDuration,
+
+		ExperimentalMaxIndexGap: DefaultMaxGapBetweenApplyAndCommitIndex,
 
 		GRPCKeepAliveMinTime:  DefaultGRPCKeepAliveMinTime,
 		GRPCKeepAliveInterval: DefaultGRPCKeepAliveInterval,
@@ -634,6 +645,7 @@ func (cfg *Config) AddFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&cfg.GRPCKeepAliveTimeout, "grpc-keepalive-timeout", cfg.GRPCKeepAliveTimeout, "Additional duration of wait before closing a non-responsive connection (0 to disable).")
 	fs.BoolVar(&cfg.SocketOpts.ReusePort, "socket-reuse-port", cfg.SocketOpts.ReusePort, "Enable to set socket option SO_REUSEPORT on listeners allowing rebinding of a port already in use.")
 	fs.BoolVar(&cfg.SocketOpts.ReuseAddress, "socket-reuse-address", cfg.SocketOpts.ReuseAddress, "Enable to set socket option SO_REUSEADDR on listeners allowing binding to an address in `TIME_WAIT` state.")
+	fs.Uint64Var(&cfg.ExperimentalMaxIndexGap, "experimental-max-index-gap", cfg.ExperimentalMaxIndexGap, "The maximum gap between committed index and applyied index in Raft progress.")
 
 	fs.Var(flags.NewUint32Value(cfg.MaxConcurrentStreams), "max-concurrent-streams", "Maximum concurrent streams that each client can open at a time.")
 

@@ -45,13 +45,8 @@ import (
 )
 
 const (
-	// In the health case, there might be a small gap (10s of entries) between
-	// the applied index and committed index.
-	// However, if the committed entries are very heavy to toApply, the gap might grow.
-	// We should stop accepting new proposals if the gap growing to a certain point.
-	maxGapBetweenApplyAndCommitIndex = 5000
-	traceThreshold                   = 100 * time.Millisecond
-	readIndexRetryTime               = 500 * time.Millisecond
+	traceThreshold     = 100 * time.Millisecond
+	readIndexRetryTime = 500 * time.Millisecond
 
 	// The timeout for the node to catch up its applied index, and is used in
 	// lease related operations, such as LeaseRenew and LeaseTimeToLive.
@@ -770,7 +765,7 @@ func (s *EtcdServer) doSerialize(ctx context.Context, chk func(*auth.AuthInfo) e
 func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.InternalRaftRequest) (*apply2.Result, error) {
 	ai := s.getAppliedIndex()
 	ci := s.getCommittedIndex()
-	if ci > ai+maxGapBetweenApplyAndCommitIndex {
+	if ci > ai+s.Cfg.ExperimentalMaxIndexGap {
 		return nil, errors.ErrTooManyRequests
 	}
 
