@@ -29,6 +29,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
 	v3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/pkg/v3/report"
 )
@@ -55,6 +56,7 @@ var (
 	compactIndexDelta int64
 
 	checkHashkv bool
+	leaseReuse  bool
 )
 
 func init() {
@@ -69,6 +71,7 @@ func init() {
 	putCmd.Flags().DurationVar(&compactInterval, "compact-interval", 0, `Interval to compact database (do not duplicate this with etcd's 'auto-compaction-retention' flag) (e.g. --compact-interval=5m compacts every 5-minute)`)
 	putCmd.Flags().Int64Var(&compactIndexDelta, "compact-index-delta", 1000, "Delta between current revision and compact revision (e.g. current revision 10000, compact at 9000)")
 	putCmd.Flags().BoolVar(&checkHashkv, "check-hashkv", false, "'true' to check hashkv")
+	putCmd.Flags().BoolVar(&leaseReuse, "lease-reuse", false, "'true' to put with reused lease, of which TTL is 20s")
 }
 
 func putFunc(cmd *cobra.Command, _ []string) {
@@ -83,6 +86,7 @@ func putFunc(cmd *cobra.Command, _ []string) {
 	}
 	limit := rate.NewLimiter(rate.Limit(putRate), 1)
 	clients := mustCreateClients(totalClients, totalConns)
+	lessor := lessor{cli: clients[0]}
 	k, v := make([]byte, keySize), string(mustRandBytes(valSize))
 
 	bar = pb.New(putTotal)
@@ -111,7 +115,19 @@ func putFunc(cmd *cobra.Command, _ []string) {
 			} else {
 				binary.PutVarint(k, int64(rand.Intn(keySpaceSize)))
 			}
-			requests <- v3.OpPut(string(k), v)
+
+			var options []clientv3.OpOption
+			if leaseReuse {
+				id, err := lessor.getLeaseID()
+				if err != nil {
+					continue
+				} else {
+					options = append(options, clientv3.WithLease(id))
+				}
+			}
+
+			putOp := v3.OpPut(string(k), v, options...)
+			requests <- putOp
 		}
 		close(requests)
 	}()
@@ -180,4 +196,23 @@ func hashKV(cmd *cobra.Command, clients []*v3.Client) {
 	rs += fmt.Sprintf("\tTime taken to get hashkv: %v\n", time.Since(st))
 	rs += fmt.Sprintf("\tDB size: %s", humanize.Bytes(uint64(rt.DbSize)))
 	fmt.Println(rs)
+}
+
+type lessor struct {
+	lastTs  time.Time
+	leaseID clientv3.LeaseID
+	cli     *clientv3.Client
+}
+
+func (l *lessor) getLeaseID() (id clientv3.LeaseID, err error) {
+	if time.Since(l.lastTs) > 30*time.Second {
+		resp, err := l.cli.Lease.Grant(context.Background(), 20)
+		if err != nil {
+			return l.leaseID, err
+		}
+		l.leaseID = resp.ID
+		l.lastTs = time.Now()
+	}
+
+	return l.leaseID, nil
 }

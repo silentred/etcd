@@ -49,7 +49,7 @@ const (
 	// the applied index and committed index.
 	// However, if the committed entries are very heavy to toApply, the gap might grow.
 	// We should stop accepting new proposals if the gap growing to a certain point.
-	maxGapBetweenApplyAndCommitIndex = 5000
+	maxGapBetweenApplyAndCommitIndex = 10
 	traceThreshold                   = 100 * time.Millisecond
 	readIndexRetryTime               = 500 * time.Millisecond
 

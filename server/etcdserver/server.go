@@ -1931,6 +1931,8 @@ func (s *EtcdServer) apply(
 
 // applyEntryNormal applies an EntryNormal type raftpb request to the EtcdServer
 func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry, shouldApplyV3 membership.ShouldApplyV3) {
+	//Max 200 QPS
+	time.Sleep(5 * time.Millisecond)
 	var ar *apply.Result
 	if shouldApplyV3 {
 		defer func() {
