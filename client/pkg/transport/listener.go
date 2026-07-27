@@ -136,6 +136,15 @@ func newListenConfig(sopts *SocketOpts) net.ListenConfig {
 	return lc
 }
 
+// CertPoolProvider exposes the currently trusted CA bundle for a TLS handshake.
+// Implementations must be safe for concurrent use because multiple handshakes
+// can consult the provider at the same time. The returned pool may be held by
+// the caller for the duration of the handshake; it must not be mutated in
+// place after being returned.
+type CertPoolProvider interface {
+	GetCertPool() *x509.CertPool
+}
+
 type TLSInfo struct {
 	// CertFile is the _server_ cert, it will also be used as a _client_ certificate if ClientCertFile is empty
 	CertFile string
@@ -207,6 +216,11 @@ type TLSInfo struct {
 
 	// LocalAddr is the local IP address to use when communicating with a peer.
 	LocalAddr string
+
+	// dynamicTrustRoots is the live trust-root source, when set. It is kept
+	// unexported so TLSInfo remains a data-only config unless callers
+	// explicitly opt in via SetDynamicTrustRoots.
+	dynamicTrustRoots CertPoolProvider
 }
 
 func (info TLSInfo) String() string {
@@ -215,6 +229,20 @@ func (info TLSInfo) String() string {
 
 func (info TLSInfo) Empty() bool {
 	return info.CertFile == "" && info.KeyFile == ""
+}
+
+// SetDynamicTrustRoots installs a live trust-root source for future handshakes.
+//
+// The setter must be called on a *TLSInfo before ServerConfig() or
+// ClientConfig() is invoked. ServerConfig() and ClientConfig() use value
+// receivers and capture the dynamicTrustRoots field by value into the
+// per-handshake closures; once a *tls.Config has been built, installing a
+// provider afterwards has no effect on that config. Callers that need late
+// injection must build a new *tls.Config after calling SetDynamicTrustRoots.
+//
+// Pass nil to remove a previously installed provider.
+func (info *TLSInfo) SetDynamicTrustRoots(provider CertPoolProvider) {
+	info.dynamicTrustRoots = provider
 }
 
 func SelfCert(lg *zap.Logger, dirpath string, hosts []string, selfSignedCertValidity uint, additionalUsages ...x509.ExtKeyUsage) (TLSInfo, error) {
@@ -516,6 +544,132 @@ func (info TLSInfo) baseConfig() (*tls.Config, error) {
 	return cfg, nil
 }
 
+// applyDynamicClientTrustRoots switches client verification to provider-backed
+// trust roots while preserving any existing post-verification checks.
+func (info TLSInfo) applyDynamicClientTrustRoots(cfg *tls.Config) error {
+	if info.dynamicTrustRoots == nil || cfg.InsecureSkipVerify {
+		return nil
+	}
+
+	var verifyAllowedConnection func(tls.ConnectionState) error
+	if info.AllowedCN != "" && len(info.AllowedCNs) > 0 {
+		return fmt.Errorf("AllowedCN and AllowedCNs are mutually exclusive (cn=%q, cns=%q)", info.AllowedCN, info.AllowedCNs)
+	}
+	if info.AllowedHostname != "" && len(info.AllowedHostnames) > 0 {
+		return fmt.Errorf("AllowedHostname and AllowedHostnames are mutually exclusive (hostname=%q, hostnames=%q)", info.AllowedHostname, info.AllowedHostnames)
+	}
+	if info.AllowedCN != "" && info.AllowedHostname != "" {
+		return fmt.Errorf("AllowedCN and AllowedHostname are mutually exclusive (cn=%q, hostname=%q)", info.AllowedCN, info.AllowedHostname)
+	}
+	if len(info.AllowedCNs) > 0 && len(info.AllowedHostnames) > 0 {
+		return fmt.Errorf("AllowedCNs and AllowedHostnames are mutually exclusive (cns=%q, hostnames=%q)", info.AllowedCNs, info.AllowedHostnames)
+	}
+
+	if info.AllowedCN != "" {
+		verifyAllowedConnection = func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 || info.AllowedCN != cs.PeerCertificates[0].Subject.CommonName {
+				return errors.New("client certificate authentication failed")
+			}
+			return nil
+		}
+	}
+	if info.AllowedHostname != "" {
+		verifyAllowedConnection = func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 || cs.PeerCertificates[0].VerifyHostname(info.AllowedHostname) != nil {
+				return errors.New("client certificate authentication failed")
+			}
+			return nil
+		}
+	}
+	if len(info.AllowedCNs) > 0 {
+		verifyAllowedConnection = func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("client certificate authentication failed")
+			}
+			for _, allowedCN := range info.AllowedCNs {
+				if allowedCN == cs.PeerCertificates[0].Subject.CommonName {
+					return nil
+				}
+			}
+			return errors.New("client certificate authentication failed")
+		}
+	}
+	if len(info.AllowedHostnames) > 0 {
+		verifyAllowedConnection = func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("client certificate authentication failed")
+			}
+			for _, allowedHostname := range info.AllowedHostnames {
+				if cs.PeerCertificates[0].VerifyHostname(allowedHostname) == nil {
+					return nil
+				}
+			}
+			return errors.New("client certificate authentication failed")
+		}
+	}
+	previousVerifyConnection := cfg.VerifyConnection
+
+	// The built-in verifier always consults cfg.RootCAs, so opt-in dynamic
+	// roots must replace that path with per-handshake verification.
+	// SAFETY: VerifyConnection is set immediately below to compensate for
+	// disabling the stdlib chain verifier.
+	cfg.InsecureSkipVerify = true
+	cfg.VerifyPeerCertificate = nil
+	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+		if err := info.verifyDynamicServerCertificate(cs, cfg.ServerName); err != nil {
+			return err
+		}
+		if previousVerifyConnection != nil {
+			if err := previousVerifyConnection(cs); err != nil {
+				return err
+			}
+		}
+		if verifyAllowedConnection != nil {
+			if err := verifyAllowedConnection(cs); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+// verifyDynamicServerCertificate reruns server verification for one handshake
+// against the latest trust roots exposed by the provider.
+func (info TLSInfo) verifyDynamicServerCertificate(cs tls.ConnectionState, fallbackServerName string) error {
+	if len(cs.PeerCertificates) == 0 {
+		return errors.New("tls: server sent no certificates")
+	}
+
+	serverName := cs.ServerName
+	if serverName == "" {
+		serverName = fallbackServerName
+	}
+	if serverName == "" {
+		return errors.New("tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config")
+	}
+	if host, _, err := net.SplitHostPort(serverName); err == nil && host != "" {
+		serverName = host
+	}
+	roots := info.dynamicTrustRoots.GetCertPool()
+	if roots == nil {
+		return errors.New("tls: dynamic trust root provider returned a nil cert pool")
+	}
+
+	intermediates := x509.NewCertPool()
+	for _, cert := range cs.PeerCertificates[1:] {
+		intermediates.AddCert(cert)
+	}
+
+	_, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{
+		DNSName:       serverName,
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		Roots:         roots,
+	})
+	return err
+}
+
 // cafiles returns a list of CA file paths.
 func (info TLSInfo) cafiles() []string {
 	cs := make([]string, 0)
@@ -555,6 +709,27 @@ func (info TLSInfo) ServerConfig() (*tls.Config, error) {
 	// "h2" NextProtos is necessary for enabling HTTP2 for go's HTTP server
 	cfg.NextProtos = []string{"h2"}
 
+	if info.dynamicTrustRoots != nil && cfg.ClientAuth == tls.RequireAndVerifyClientCert {
+		// baseCfg is the prepared server policy (TLS version, cipher suites,
+		// allowed CN/hostname checks, NextProtos, etc.). It is cloned once
+		// and reused for every new handshake; only ClientCAs is replaced.
+		// baseCfg.GetConfigForClient must be cleared so the stdlib does not
+		// recurse into a callback that itself clones the same base.
+		baseCfg := cfg.Clone()
+		baseCfg.GetConfigForClient = nil
+
+		// Prime the listener with the most recent trust roots so the config
+		// exposed by ServerConfig matches what the next handshake will evaluate.
+		cfg.ClientCAs = info.dynamicTrustRoots.GetCertPool()
+		cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			clone := baseCfg.Clone()
+			// Each new handshake must fetch trust roots again so CA rotation
+			// does not require rebuilding the listener.
+			clone.ClientCAs = info.dynamicTrustRoots.GetCertPool()
+			return clone, nil
+		}
+	}
+
 	return cfg, nil
 }
 
@@ -583,6 +758,9 @@ func (info TLSInfo) ClientConfig() (*tls.Config, error) {
 
 	if info.selfCert {
 		cfg.InsecureSkipVerify = true
+	}
+	if err := info.applyDynamicClientTrustRoots(cfg); err != nil {
+		return nil, err
 	}
 
 	if info.EmptyCN {
